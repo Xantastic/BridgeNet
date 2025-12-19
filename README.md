@@ -111,6 +111,7 @@ Each category (e.g., cookie, dowel) contains:
 We provide a simple shell script to run BridgeNet on the MVTec-3D dataset:
 
 ```bash
+cd shell
 bash run-mvtec.sh
 ```
 
