@@ -146,6 +146,6 @@ If you use BridgeNet in your research, please cite:
 We would like to thank the following repositories for their valuable contributions and support:
 
 - [GLASS](https://github.com/Xantastic/BridgeNet.git)
-- [3DSR](https://github.com/cqylunlun/GLASS):
+- [3DSR](https://github.com/cqylunlun/GLASS)
 
 These open-source projects have been instrumental in advancing the field of anomaly detection.
