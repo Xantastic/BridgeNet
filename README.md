@@ -101,8 +101,8 @@ mvtec_process/
 Each category (e.g., cookie, dowel) contains:
 - `train/good/`: Normal training samples
 - `test/good/`: Normal test samples
-- `test/<defect>/`: Defective test samples
-- `ground_truth/<defect>/`: Ground truth masks for defects
+- `test/<anomaly>/`: Anomalous test samples
+- `ground_truth/<anomaly>/`: Ground truth masks for anomalies
 
 ## Running BridgeNet
 
