@@ -133,14 +133,14 @@ results/
 If you use BridgeNet in your research, please cite:
 
 ```bibtex
-@article{bridgenet2025,
+@inproceedings{xiang2025bridgenet,
   title={BridgeNet: A Unified Multimodal Framework for Bridging 2D and 3D Industrial Anomaly Detection},
   author={Xiang, An and Huang, Zixuan and Gao, Xitong and Ye, Kejiang and Xu, Cheng-zhong},
-  journal={ACM Multimedia},
+  booktitle={Proceedings of the 33rd ACM International Conference on Multimedia},
+  pages={1579--1587},
   year={2025}
 }
 ```
-
 ## Acknowledgments
 
 We would like to thank the following repositories for their valuable contributions and support:
