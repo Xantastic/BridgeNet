@@ -55,12 +55,9 @@ class BridgeNet(torch.nn.Module):
             eval_epochs=1,
             dsc_layers=2,
             dsc_hidden=1024,
-            dsc_margin=0.5,
             train_backbone=False,
             pre_proj=1,
             noise=0.015,
-            radius=0.75,
-            p=0.5,
             lr=0.0001,
             step=20,
             limit=392,
@@ -118,12 +115,9 @@ class BridgeNet(torch.nn.Module):
         self.discriminator = Discriminator(self.target_embed_dimension * 2, n_layers=dsc_layers, hidden=dsc_hidden * 2)
         self.discriminator.to(self.device)
         self.dsc_opt = torch.optim.AdamW(self.discriminator.parameters(), lr=lr * 2)
-        self.dsc_margin = dsc_margin
 
         self.c = torch.tensor(0)
         self.c_ = torch.tensor(0)
-        self.p = p
-        self.radius = radius
         self.noise = noise
         self.step = step
         self.limit = limit

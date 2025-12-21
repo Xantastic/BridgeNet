@@ -25,7 +25,6 @@ def main(**kwargs):
 
 
 @main.command("net")
-@click.option("--dsc_margin", type=float, default=0.5)
 @click.option("--train_backbone", is_flag=True)
 @click.option("--backbone_names", "-b", type=str, multiple=True, default=[])
 @click.option("--layers_to_extract_from", "-le", type=str, multiple=True, default=[])
@@ -38,8 +37,6 @@ def main(**kwargs):
 @click.option("--dsc_hidden", type=int, default=1024)
 @click.option("--pre_proj", type=int, default=1)
 @click.option("--noise", type=float, default=0.015)
-@click.option("--radius", type=float, default=0.75)
-@click.option("--p", type=float, default=0.5)
 @click.option("--lr", type=float, default=0.00005)
 @click.option("--step", type=int, default=20)
 @click.option("--limit", type=int, default=392)
@@ -53,12 +50,9 @@ def net(
         eval_epochs,
         dsc_layers,
         dsc_hidden,
-        dsc_margin,
         train_backbone,
         pre_proj,
         noise,
-        radius,
-        p,
         lr,
         step,
         limit,
@@ -98,12 +92,9 @@ def net(
                 eval_epochs=eval_epochs,
                 dsc_layers=dsc_layers,
                 dsc_hidden=dsc_hidden,
-                dsc_margin=dsc_margin,
                 train_backbone=train_backbone,
                 pre_proj=pre_proj,
                 noise=noise,
-                radius=radius,
-                p=p,
                 lr=lr,
                 step=step,
                 limit=limit,

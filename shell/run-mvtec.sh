@@ -21,8 +21,6 @@ python main.py \
     --dsc_hidden 1536 \
     --pre_proj 1 \
     --noise 0.02 \
-    --radius 0.75 \
-    --p 0.5 \
     --step 20 \
     --limit 392 \
   dataset \
@@ -31,5 +29,5 @@ python main.py \
     --std 0.3 \
     --rand_aug 1 \
     --batch_size 4 \
-    --resize 576 \
-    --imagesize 576 "${flags[@]}" mvtec $datapath $augpath
+    --resize 224 \
+    --imagesize 224 "${flags[@]}" mvtec $datapath $augpath
