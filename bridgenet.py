@@ -88,9 +88,6 @@ class BridgeNet(torch.nn.Module):
         preprocessing = common.Preprocessing(feature_dimensions, pretrain_embed_dimension)
         self.forward_modules["preprocessing"] = preprocessing
 
-        preprocessing_3D = common.Preprocessing3D(feature_dimensions_depth, pretrain_embed_dimension)
-        self.forward_modules["preprocessing_3D"] = preprocessing_3D
-
         self.target_embed_dimension = target_embed_dimension
         preadapt_aggregator = common.Aggregator(target_dim=target_embed_dimension)
         preadapt_aggregator.to(self.device)
