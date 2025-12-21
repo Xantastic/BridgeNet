@@ -104,7 +104,7 @@ Each category (e.g., cookie, dowel) contains:
 - `test/<anomaly>/`: Anomalous test samples
 - `ground_truth/<anomaly>/`: Ground truth masks for anomalies
 
-### Running BridgeNet
+### 3. Running BridgeNet
 
 We provide a simple shell script to run BridgeNet on the MVTec-3D dataset:
 
@@ -113,7 +113,7 @@ cd shell
 bash run-mvtec.sh
 ```
 
-### Results
+### 4. Results
 
 Results will be saved in the `results/` directory with the following structure:
 ```
