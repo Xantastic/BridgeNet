@@ -1,7 +1,7 @@
 # BridgeNet: A Unified Multimodal Framework for Bridging 2D and 3D Industrial Anomaly Detection
 An Xiang*, Zixuan Huang*, Xitong Gao*, Kejiang Ye†, Cheng-zhong Xu (* Equal contribution; † Corresponding authors)
 
-Our paper has been accepted by ACM MM 2025 [[ACM MM]](https://github.com/Xantastic/BridgeNet).
+Our paper has been accepted by ACM MM 2025 [[Paper]](https://dl.acm.org/doi/pdf/10.1145/3746027.3755261).
 ![](figures/bridgenet.png)
 
 ## Quick Start
@@ -103,6 +103,9 @@ Each category (e.g., cookie, dowel) contains:
 - `test/good/`: Normal test samples
 - `test/<anomaly>/`: Anomalous test samples
 - `ground_truth/<anomaly>/`: Ground truth masks for anomalies
+
+The dataset formatted [[coming soon]](https://github.com/Xantastic/BridgeNet)
+Original dataset [[mvtec3d]](https://www.mvtec.com/company/research/datasets/mvtec-3d-ad)
 
 ### 3. Running BridgeNet
 
