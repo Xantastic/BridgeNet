@@ -107,6 +107,7 @@ Each category (e.g., cookie, dowel) contains:
 - `ground_truth/<anomaly>/`: Ground truth masks for anomalies
 
 The dataset formatted [[coming soon]](https://github.com/Xantastic/BridgeNet)
+
 Original dataset [[mvtec3d]](https://www.mvtec.com/company/research/datasets/mvtec-3d-ad)
 
 ### 3. Running BridgeNet
