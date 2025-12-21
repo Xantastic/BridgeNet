@@ -116,14 +116,17 @@ bash run-mvtec.sh
 ### 4. Results
 
 Results will be saved in the `results/` directory with the following structure:
+/root/3D/BridgeNet-main_/results/models/backbone_0/mvtec3d_foam
 ```
 results/
-└── project/
-    └── group/
-        └── test/
-            ├── models/
-            │   └── backbone_0/
-            └── results.txt
+├── models/
+│   └── backbone_0/
+│       └── class_name/
+├── eval
+│   └── class_name/
+└── training/            
+    └── class_name/            
+            
 ```
 
 ## Citation
