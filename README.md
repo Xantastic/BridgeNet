@@ -19,11 +19,11 @@ Our paper has been accepted by ACM MM 2025 [[ACM MM]](https://github.com/Xantast
 git clone https://github.com/Bridgenet-3D/BridgeNet.git
 cd BridgeNet
 
-# Create conda environment (environment name is 'base')
+# Create conda environment (environment name is 'bridgenet')
 conda env create -f environment.yml
 
 # Activate environment
-conda activate base
+conda activate bridgenet
 ```
 
 #### Option B: Manual Installation

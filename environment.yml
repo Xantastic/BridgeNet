@@ -1,4 +1,4 @@
-name: base
+name: bridgenet
 channels:
   - https://anaconda.org/pytorch3d/pytorch3d/0.7.4/download
   - conda-forge
