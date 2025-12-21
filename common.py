@@ -22,6 +22,18 @@ class Preprocessing(torch.nn.Module):
             _features.append(module(feature))
         return torch.stack(_features, dim=1) if len(_features) > 1 else _features
 
+class Preprocessing3D(torch.nn.Module):
+    def __init__(self, input_dims, output_dim):
+        super(Preprocessing3D, self).__init__()
+        self.input_dims = input_dims
+        self.output_dim = output_dim
+
+        self.module = MeanMapper(output_dim)
+
+    def forward(self, depth):
+        _depth = self.module(depth)
+        return _depth
+
 class MeanMapper(torch.nn.Module):
     def __init__(self, preprocessing_dim):
         super(MeanMapper, self).__init__()

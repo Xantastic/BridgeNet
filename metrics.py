@@ -4,7 +4,6 @@ from skimage import measure
 import cv2
 import numpy as np
 import pandas as pd
-import auproUtil
 
 
 def compute_best_pr_re(anomaly_ground_truth_labels, anomaly_prediction_weights):
@@ -52,32 +51,35 @@ def compute_pixelwise_retrieval_metrics(anomaly_segmentations, ground_truth_mask
 
 
 def compute_pro(masks, amaps, num_th=200):
-    """
-    Compute PRO curve and its integral using auproUtil.
+    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
+    binary_amaps = np.zeros_like(amaps, dtype=bool)
 
-    Args:
-        masks: List of ground truth masks or 3D numpy array
-        amaps: List of anomaly maps or 3D numpy array
-        num_th: Number of thresholds (not used by auproUtil, kept for compatibility)
+    min_th = amaps.min()
+    max_th = amaps.max()
+    delta = (max_th - min_th) / num_th
 
-    Returns:
-        pro_auc: Area under the PRO curve integrated up to 30% FPR
-    """
-    # Convert inputs to list format if they are arrays
-    if isinstance(masks, np.ndarray):
-        if masks.ndim == 3:
-            masks = [masks[i] for i in range(masks.shape[0])]
-        else:
-            masks = [masks]
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    for th in np.arange(min_th, max_th, delta):
+        binary_amaps[amaps <= th] = 0
+        binary_amaps[amaps > th] = 1
 
-    if isinstance(amaps, np.ndarray):
-        if amaps.ndim == 3:
-            amaps = [amaps[i] for i in range(amaps.shape[0])]
-        else:
-            amaps = [amaps]
+        pros = []
+        for binary_amap, mask in zip(binary_amaps, masks):
+            binary_amap = cv2.dilate(binary_amap.astype(np.uint8), k)
+            for region in measure.regionprops(measure.label(mask)):
+                axes0_ids = region.coords[:, 0]
+                axes1_ids = region.coords[:, 1]
+                tp_pixels = binary_amap[axes0_ids, axes1_ids].sum()
+                pros.append(tp_pixels / region.area)
 
-    # Calculate AU-PRO using auproUtil with 30% FPR integration limit
-    au_pro, _ = auproUtil.calculate_au_pro(gts=masks, predictions=amaps,
-                                           integration_limit=0.3, num_thresholds=100)
+        inverse_masks = 1 - masks
+        fp_pixels = np.logical_and(inverse_masks, binary_amaps).sum()
+        fpr = fp_pixels / inverse_masks.sum()
 
-    return au_pro
+        df = df.append({"pro": np.mean(pros), "fpr": fpr, "threshold": th}, ignore_index=True)
+
+    df = df[df["fpr"] < 0.3]
+    df["fpr"] = (df["fpr"] - df["fpr"].min()) / (df["fpr"].max() - df["fpr"].min() + 1e-10)
+
+    pro_auc = metrics.auc(df["fpr"], df["pro"])
+    return pro_auc

@@ -1,9 +1,13 @@
-cd ../
+datapath=/root/3D/GLASS-mvtec-3d-dataset/datasets/mvtec_process
+augpath=/root/3D/GLASS-mvtec-3d-dataset/datasets/dtd/images
+classes=('cookie')
+flags=($(for class in "${classes[@]}"; do echo '-d '"${class}"; done))
+
+cd ..
 python main.py \
-    --gpu 1 \
-    --seed 10 \
-    --results_path /root/3D/BridgeNet-github-refactor/results \
-    --test_mode ckpt \
+    --gpu 2 \
+    --seed 42 \
+    --test ckpt \
   net \
     -b wideresnet50 \
     -le layer2 \
@@ -17,16 +21,15 @@ python main.py \
     --dsc_hidden 1536 \
     --pre_proj 1 \
     --noise 0.02 \
+    --radius 0.75 \
+    --p 0.5 \
     --step 20 \
     --limit 392 \
   dataset \
+    --distribution 0 \
     --mean 0.5 \
     --std 0.3 \
-    --fg 1 \
     --rand_aug 1 \
     --batch_size 4 \
-    --imagesize 576 \
-    -d cable_gland \
-    mvtec \
-    /root/3D/GLASS-mvtec-3d-dataset/datasets/mvtec_process \
-    /root/3D/GLASS-mvtec-3d-dataset/datasets/dtd/images
+    --resize 576 \
+    --imagesize 576 "${flags[@]}" mvtec $datapath $augpath

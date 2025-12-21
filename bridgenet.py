@@ -1,9 +1,11 @@
 from loss import FocalLoss
 from collections import OrderedDict
+from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 from model import Discriminator, Projection, PatchMaker
 
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
 from torch import nn
 
@@ -14,227 +16,165 @@ import torch
 import tqdm
 import common
 import metrics
-import utils
-import shutil
 import cv2
-import fnmatch
+import utils
 import glob
+import shutil
 
 LOGGER = logging.getLogger(__name__)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-class TensorBoardWrapper:
-    """Wrapper for TensorBoard logging functionality."""
-
+class TBWrapper:
     def __init__(self, log_dir):
-        self.global_iteration = 0
+        self.g_iter = 0
         self.logger = SummaryWriter(log_dir=log_dir)
 
     def step(self):
-        """Increment the global iteration counter."""
-        self.global_iteration += 1
+        self.g_iter += 1
 
 
 class BridgeNet(torch.nn.Module):
-    """
-    BridgeNet model for anomaly detection using RGB and depth data.
-    Combines features from both modalities for robust anomaly detection.
-    """
-
     def __init__(self, device):
         super(BridgeNet, self).__init__()
         self.device = device
 
     def load(
-        self,
-        backbone_network,
-        backbone_depth_network,
-        layers_to_extract_from,
-        device,
-        input_shape,
-        pretrain_embed_dimension,
-        target_embed_dimension,
-        patchsize=3,
-        patchstride=1,
-        meta_epochs=640,
-        eval_epochs=1,
-        dsc_layers=2,
-        dsc_hidden=1024,
-        dsc_margin=0.5,
-        train_backbone=False,
-        pre_proj=1,
-        noise=0.015,
-        lr=0.0001,
-        svd=0,
-        step=20,
-        limit=392,
-        down_scale=16,
-        **kwargs,
+            self,
+            backbone,
+            backbone_depth,
+            layers_to_extract_from,
+            device,
+            input_shape,
+            pretrain_embed_dimension,
+            target_embed_dimension,
+            patchsize=3,
+            patchstride=1,
+            meta_epochs=640,
+            eval_epochs=1,
+            dsc_layers=2,
+            dsc_hidden=1024,
+            dsc_margin=0.5,
+            train_backbone=False,
+            pre_proj=1,
+            noise=0.015,
+            radius=0.75,
+            p=0.5,
+            lr=0.0001,
+            step=20,
+            limit=392,
+            down_scale=16,
+            **kwargs,
     ):
-        """Initialize the BridgeNet model with specified parameters."""
 
-        # Network architectures
-        self.backbone_network = backbone_network.to(device)
-        self.backbone_depth_network = backbone_depth_network.to(device)
+        self.backbone = backbone.to(device)
+        self.backbone_depth = backbone_depth.to(device)
         self.layers_to_extract_from = layers_to_extract_from
         self.input_shape = input_shape
         self.device = device
 
-        # Feature aggregation modules
         self.forward_modules = torch.nn.ModuleDict({})
 
-        # Depth feature aggregator
         feature_aggregator_depth = common.NetworkFeatureAggregatorDepth(
-            self.backbone_network, self.layers_to_extract_from, self.device, train_backbone
+            self.backbone, self.layers_to_extract_from, self.device, train_backbone
         )
         feature_dimensions_depth = feature_aggregator_depth.feature_dimensions(input_shape)
         self.forward_modules["feature_aggregator_depth"] = feature_aggregator_depth
 
-        # RGB feature aggregator
         feature_aggregator = common.NetworkFeatureAggregator(
-            self.backbone_depth_network, self.layers_to_extract_from, self.device, train_backbone
+            self.backbone_depth, self.layers_to_extract_from, self.device, train_backbone
         )
         feature_dimensions = feature_aggregator.feature_dimensions(input_shape)
         self.forward_modules["feature_aggregator"] = feature_aggregator
 
-        # Preprocessing modules
         preprocessing = common.Preprocessing(feature_dimensions, pretrain_embed_dimension)
         self.forward_modules["preprocessing"] = preprocessing
 
-        preprocessing_depth = common.Preprocessing(feature_dimensions_depth, pretrain_embed_dimension)
-        self.forward_modules["preprocessing_depth"] = preprocessing_depth
+        preprocessing_3D = common.Preprocessing3D(feature_dimensions_depth, pretrain_embed_dimension)
+        self.forward_modules["preprocessing_3D"] = preprocessing_3D
 
-        # Target embedding dimension
         self.target_embed_dimension = target_embed_dimension
-
-        # Feature aggregators
         preadapt_aggregator = common.Aggregator(target_dim=target_embed_dimension)
         preadapt_aggregator.to(self.device)
         self.forward_modules["preadapt_aggregator"] = preadapt_aggregator
 
-        preadapt_aggregator_depth = common.Aggregator(target_dim=target_embed_dimension)
-        preadapt_aggregator_depth.to(self.device)
-        self.forward_modules["preadapt_aggregator_depth"] = preadapt_aggregator_depth
-
-        # Training parameters
         self.meta_epochs = meta_epochs
-        self.learning_rate = lr
+        self.lr = lr
         self.train_backbone = train_backbone
-
-        # Backbone optimizer
         if self.train_backbone:
-            self.backbone_optimizer = torch.optim.AdamW(
-                self.forward_modules["feature_aggregator"].backbone.parameters(),
-                lr
-            )
-            self.backbone_depth_optimizer = torch.optim.AdamW(
-                self.forward_modules["feature_aggregator_depth"].backbone.parameters(),
-                lr
-            )
+            self.backbone_opt = torch.optim.AdamW(self.forward_modules["feature_aggregator"].backbone.parameters(), lr)
 
-        # Pre-projection settings
         self.pre_proj = pre_proj
-        if self.pre_proj <= 0:
-            raise ValueError("pre_proj must be greater than 0")
-
         if self.pre_proj > 0:
-            self.pre_projection = Projection(
-                self.target_embed_dimension * 2,
-                self.target_embed_dimension * 2,
-                pre_proj
-            )
+            self.pre_projection = Projection(self.target_embed_dimension * 2, self.target_embed_dimension * 2, pre_proj)
             self.pre_projection.to(self.device)
-            self.projection_optimizer = torch.optim.Adam(
-                self.pre_projection.parameters(),
-                lr,
-                weight_decay=1e-5
-            )
+            self.proj_opt = torch.optim.Adam(self.pre_projection.parameters(), lr, weight_decay=1e-5)
 
-        # Evaluation parameters
+
         self.eval_epochs = eval_epochs
         self.dsc_layers = dsc_layers
         self.dsc_hidden = dsc_hidden
-
-        # Discriminator
-        self.discriminator = Discriminator(
-            self.target_embed_dimension * 2,
-            n_layers=dsc_layers,
-            hidden=dsc_hidden * 2
-        )
+        self.discriminator = Discriminator(self.target_embed_dimension * 2, n_layers=dsc_layers, hidden=dsc_hidden * 2)
         self.discriminator.to(self.device)
-        self.discriminator_optimizer = torch.optim.AdamW(
-            self.discriminator.parameters(),
-            lr * 2
-        )
+        self.dsc_opt = torch.optim.AdamW(self.discriminator.parameters(), lr=lr * 2)
         self.dsc_margin = dsc_margin
 
-        # Training parameters
-        self.positive_center = torch.tensor(0)
-        self.negative_center = torch.tensor(0)
-        self.noise_level = noise
-        self.svd = svd
+        self.c = torch.tensor(0)
+        self.c_ = torch.tensor(0)
+        self.p = p
+        self.radius = radius
+        self.noise = noise
         self.step = step
-        self.sample_limit = limit
-        self.distribution = 0
+        self.limit = limit
         self.focal_loss = FocalLoss()
 
-        # Patch processing
         self.patch_maker = PatchMaker(patchsize, stride=patchstride)
-        self.anomaly_segmentor = common.RescaleSegmentor(
-            device=self.device,
-            target_size=input_shape[-2:]
-        )
-
-        # Model directories
+        self.anomaly_segmentor = common.RescaleSegmentor(device=self.device, target_size=input_shape[-2:])
         self.model_dir = ""
         self.dataset_name = ""
         self.logger = None
 
-        # Pixel unshuffle for downsampling
-        self.pixel_unshuffle = nn.PixelUnshuffle(down_scale // 2)
+        self.unshuffle = nn.PixelUnshuffle(down_scale//2)
 
     def set_model_dir(self, model_dir, dataset_name):
-        """Set up model directories and logging."""
         self.model_dir = model_dir
         os.makedirs(self.model_dir, exist_ok=True)
-        self.checkpoint_dir = os.path.join(self.model_dir, dataset_name)
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        self.tensorboard_dir = os.path.join(self.checkpoint_dir, "tb")
-        os.makedirs(self.tensorboard_dir, exist_ok=True)
-        self.logger = TensorBoardWrapper(self.tensorboard_dir)
+        self.ckpt_dir = os.path.join(self.model_dir, dataset_name)
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        self.tb_dir = os.path.join(self.ckpt_dir, "tb")
+        os.makedirs(self.tb_dir, exist_ok=True)
+        self.logger = TBWrapper(self.tb_dir)
 
-    def get_rgb_depth_noise(self, scale_factor, rgb_image, depth_image):
-        """Generate noise for RGB and depth images."""
+    def get_rgb_depth_noise(self, scale, image, depth):
+        """Generate random noise for RGB and depth with probability-based selection."""
         random_value = np.random.rand()
-
         if random_value > 0.66:
-            # Add noise to both RGB and depth
-            rgb_noise = torch.normal(0, self.noise_level * scale_factor, rgb_image.shape).to(self.device)
-            depth_noise = torch.normal(0, self.noise_level * scale_factor, depth_image.shape).to(self.device)
+            rgb_noise = torch.normal(0, self.noise * scale, image.shape).to(self.device)
+            depth_noise = torch.normal(0, self.noise * scale, depth.shape).to(self.device)
         elif random_value > 0.33:
-            # Add noise only to RGB
-            rgb_noise = torch.normal(0, self.noise_level * scale_factor, rgb_image.shape).to(self.device)
+            rgb_noise = torch.normal(0, self.noise * scale, image.shape).to(self.device)
             depth_noise = 0
         else:
-            # Add noise only to depth
             rgb_noise = 0
-            depth_noise = torch.normal(0, self.noise_level * scale_factor, depth_image.shape).to(self.device)
-
+            depth_noise = torch.normal(0, self.noise * scale, depth.shape).to(self.device)
         return rgb_noise, depth_noise
 
-    def embed_features(
-        self,
-        images,
-        depths=None,
-        detach=True,
-        provide_patch_shapes=False,
-        evaluation=False
-    ):
-        """Extract and embed features from RGB and depth images."""
 
-        # Extract RGB features
+
+    def _embed(self, images, depths=None, detach=True, provide_patch_shapes=False, evaluation=False):
+        """Extract feature embeddings from RGB images and depth maps.
+
+        Args:
+            images: RGB images tensor
+            depths: Depth maps tensor (optional)
+            detach: Whether to detach gradients (unused)
+            provide_patch_shapes: Whether to return patch shape information
+            evaluation: Whether in evaluation mode
+
+        Returns:
+            Tuple of (rgb_features, patch_shapes, depth_features)
+        """
         if not evaluation and self.train_backbone:
             self.forward_modules["feature_aggregator"].train()
             rgb_features = self.forward_modules["feature_aggregator"](images, eval=evaluation)
@@ -243,555 +183,393 @@ class BridgeNet(torch.nn.Module):
             with torch.no_grad():
                 rgb_features = self.forward_modules["feature_aggregator"](images)
 
-        # Extract depth features
         depth_features = None
         if depths is not None:
             self.forward_modules["feature_aggregator_depth"].eval()
             with torch.no_grad():
                 depth_features = self.forward_modules["feature_aggregator_depth"](depths)
 
-        # Process RGB features
+
+
+        # Extract features from specified layers
         rgb_features = [rgb_features[layer] for layer in self.layers_to_extract_from]
+        depth_features = [depth_features[layer] for layer in self.layers_to_extract_from]
 
-        # Process depth features
-        if depth_features is not None:
-            depth_features = [depth_features[layer] for layer in self.layers_to_extract_from]
-
-        # Reshape transformer features if needed
+        # Reshape features if needed (for ViT-style outputs)
         for i, feature in enumerate(rgb_features):
             if len(feature.shape) == 3:
-                batch_size, sequence_length, channels = feature.shape
-                rgb_features[i] = feature.reshape(
-                    batch_size,
-                    int(math.sqrt(sequence_length)),
-                    int(math.sqrt(sequence_length)),
-                    channels
-                ).permute(0, 3, 1, 2)
+                batch_size, seq_len, channels = feature.shape
+                spatial_size = int(math.sqrt(seq_len))
+                rgb_features[i] = feature.reshape(batch_size, spatial_size, spatial_size, channels).permute(0, 3, 1, 2)
 
-        # Reshape transformer depth features if needed
-        if depth_features is not None:
-            for i, depth_feature in enumerate(depth_features):
-                if len(depth_feature.shape) == 3:
-                    batch_size, sequence_length, channels = depth_feature.shape
-                    depth_features[i] = depth_feature.reshape(
-                        batch_size,
-                        int(math.sqrt(sequence_length)),
-                        int(math.sqrt(sequence_length)),
-                        channels
-                    ).permute(0, 3, 1, 2)
+        for i, depth_feature in enumerate(depth_features):
+            if len(depth_feature.shape) == 3:
+                batch_size, seq_len, channels = depth_feature.shape
+                spatial_size = int(math.sqrt(seq_len))
+                depth_features[i] = depth_feature.reshape(batch_size, spatial_size, spatial_size, channels).permute(0, 3, 1, 2)
 
-        # Create patches from RGB features
-        rgb_patches = [self.patch_maker.patchify(x, return_spatial_info=True) for x in rgb_features]
-        rgb_patch_shapes = [x[1] for x in rgb_patches]
-        rgb_patch_features = [x[0] for x in rgb_patches]
+        # Convert features to patches
+        rgb_patches_with_info = [self.patch_maker.patchify(x, return_spatial_info=True) for x in rgb_features]
+        patch_shapes = [x[1] for x in rgb_patches_with_info]
+        rgb_patch_features = [x[0] for x in rgb_patches_with_info]
 
-        # Create patches from depth features
-        depth_patches = None
-        depth_patch_shapes = None
-        depth_patch_features = None
+        depth_patches_with_info = [self.patch_maker.patchify(x, return_spatial_info=True) for x in depth_features]
+        depth_patch_shapes = [x[1] for x in depth_patches_with_info]
+        depth_patch_features = [x[0] for x in depth_patches_with_info]
 
-        if depth_features is not None:
-            depth_patches = [self.patch_maker.patchify(x, return_spatial_info=True) for x in depth_features]
-            depth_patch_shapes = [x[1] for x in depth_patches]
-            depth_patch_features = [x[0] for x in depth_patches]
+        reference_patch_size = patch_shapes[0]
 
-        # Reference patch dimensions
-        reference_rgb_patches = rgb_patch_shapes[0]
-        reference_depth_patches = depth_patch_shapes[0] if depth_patch_shapes is not None else None
-
-        # Process multi-scale features
+        # Align all patches to the same spatial resolution
         for i in range(1, len(rgb_patch_features)):
-            current_rgb_features = rgb_patch_features[i]
-            current_depth_features = depth_patch_features[i] if depth_patch_features is not None else None
-            current_patch_dims = rgb_patch_shapes[i]
+            current_rgb_patches = rgb_patch_features[i]
+            current_depth_patches = depth_patch_features[i]
+            current_patch_dims = patch_shapes[i]
 
-            # Reshape RGB features
-            current_rgb_features = current_rgb_features.reshape(
-                current_rgb_features.shape[0],
-                current_patch_dims[0],
-                current_patch_dims[1],
-                *current_rgb_features.shape[2:]
+            # Reshape to spatial format
+            current_rgb_patches = current_rgb_patches.reshape(
+                current_rgb_patches.shape[0], current_patch_dims[0], current_patch_dims[1], *current_rgb_patches.shape[2:]
+            )
+            current_depth_patches = current_depth_patches.reshape(
+                current_depth_patches.shape[0], current_patch_dims[0], current_patch_dims[1], *current_depth_patches.shape[2:]
             )
 
-            # Reshape depth features
-            if current_depth_features is not None:
-                current_depth_features = current_depth_features.reshape(
-                    current_depth_features.shape[0],
-                    current_patch_dims[0],
-                    current_patch_dims[1],
-                    *current_depth_features.shape[2:]
-                )
+            # Permute for interpolation
+            current_rgb_patches = current_rgb_patches.permute(0, -3, -2, -1, 1, 2)
+            current_depth_patches = current_depth_patches.permute(0, -3, -2, -1, 1, 2)
 
-            # Permute dimensions for interpolation
-            current_rgb_features = current_rgb_features.permute(0, -3, -2, -1, 1, 2)
-            if current_depth_features is not None:
-                current_depth_features = current_depth_features.permute(0, -3, -2, -1, 1, 2)
+            base_shape = current_rgb_patches.shape
 
-            # Store original shape
-            original_shape = current_rgb_features.shape
-
-            # Reshape for interpolation
-            current_rgb_features = current_rgb_features.reshape(-1, *current_rgb_features.shape[-2:])
-            if current_depth_features is not None:
-                current_depth_features = current_depth_features.reshape(-1, *current_depth_features.shape[-2:])
+            # Flatten for interpolation
+            current_rgb_patches = current_rgb_patches.reshape(-1, *current_rgb_patches.shape[-2:])
+            current_depth_patches = current_depth_patches.reshape(-1, *current_depth_patches.shape[-2:])
 
             # Interpolate to reference size
-            current_rgb_features = F.interpolate(
-                current_rgb_features.unsqueeze(1),
-                size=(reference_rgb_patches[0], reference_rgb_patches[1]),
+            current_rgb_patches = F.interpolate(
+                current_rgb_patches.unsqueeze(1),
+                size=(reference_patch_size[0], reference_patch_size[1]),
+                mode="bilinear",
+                align_corners=False,
+            )
+            current_depth_patches = F.interpolate(
+                current_depth_patches.unsqueeze(1),
+                size=(reference_patch_size[0], reference_patch_size[1]),
                 mode="bilinear",
                 align_corners=False,
             )
 
-            if current_depth_features is not None:
-                current_depth_features = F.interpolate(
-                    current_depth_features.unsqueeze(1),
-                    size=(reference_rgb_patches[0], reference_rgb_patches[1]),
-                    mode="bilinear",
-                    align_corners=False,
-                )
+            current_rgb_patches = current_rgb_patches.squeeze(1)
+            current_depth_patches = current_depth_patches.squeeze(1)
 
-            # Squeeze and reshape
-            current_rgb_features = current_rgb_features.squeeze(1)
-            if current_depth_features is not None:
-                current_depth_features = current_depth_features.squeeze(1)
-
-            current_rgb_features = current_rgb_features.reshape(
-                *original_shape[:-2],
-                reference_rgb_patches[0],
-                reference_rgb_patches[1]
+            # Reshape back
+            current_rgb_patches = current_rgb_patches.reshape(
+                *base_shape[:-2], reference_patch_size[0], reference_patch_size[1]
+            )
+            current_depth_patches = current_depth_patches.reshape(
+                *base_shape[:-2], reference_patch_size[0], reference_patch_size[1]
             )
 
-            if current_depth_features is not None:
-                current_depth_features = current_depth_features.reshape(
-                    *original_shape[:-2],
-                    reference_rgb_patches[0],
-                    reference_rgb_patches[1]
-                )
+            # Permute back
+            current_rgb_patches = current_rgb_patches.permute(0, -2, -1, 1, 2, 3)
+            current_depth_patches = current_depth_patches.permute(0, -2, -1, 1, 2, 3)
 
-            # Permute back and finalize
-            current_rgb_features = current_rgb_features.permute(0, -2, -1, 1, 2, 3)
-            if current_depth_features is not None:
-                current_depth_features = current_depth_features.permute(0, -2, -1, 1, 2, 3)
+            # Final reshape
+            current_rgb_patches = current_rgb_patches.reshape(len(current_rgb_patches), -1, *current_rgb_patches.shape[-3:])
+            current_depth_patches = current_depth_patches.reshape(len(current_depth_patches), -1, *current_depth_patches.shape[-3:])
 
-            current_rgb_features = current_rgb_features.reshape(
-                len(current_rgb_features),
-                -1,
-                *current_rgb_features.shape[-3:]
-            )
+            rgb_patch_features[i] = current_rgb_patches
+            depth_patch_features[i] = current_depth_patches
 
-            if current_depth_features is not None:
-                current_depth_features = current_depth_features.reshape(
-                    len(current_depth_features),
-                    -1,
-                    *current_depth_features.shape[-3:]
-                )
-
-            # Update feature lists
-            rgb_patch_features[i] = current_rgb_features
-            if current_depth_features is not None:
-                depth_patch_features[i] = current_depth_features
-
-        # Process patches through preprocessing and aggregation
+        # Preprocess and aggregate patches
         rgb_patch_features = [x.reshape(-1, *x.shape[-3:]) for x in rgb_patch_features]
         rgb_patch_features = self.forward_modules["preprocessing"](rgb_patch_features)
         rgb_patch_features = self.forward_modules["preadapt_aggregator"](rgb_patch_features)
 
-        if depth_patch_features is not None:
-            depth_patch_features = [x.reshape(-1, *x.shape[-3:]) for x in depth_patch_features]
-            depth_patch_features = self.forward_modules["preprocessing_depth"](depth_patch_features)
-            depth_patch_features = self.forward_modules["preadapt_aggregator_depth"](depth_patch_features)
+        depth_patch_features = [x.reshape(-1, *x.shape[-3:]) for x in depth_patch_features]
+        depth_patch_features = self.forward_modules["preprocessing"](depth_patch_features)
+        depth_patch_features = self.forward_modules["preadapt_aggregator"](depth_patch_features)
 
-        return rgb_patch_features, rgb_patch_shapes, depth_patch_features
+        return rgb_patch_features, patch_shapes, depth_patch_features
 
-    def trainer(self, training_data, validation_data, dataset_name):
-        """Train the BridgeNet model."""
-        model_state_dict = {}
-        checkpoint_paths = glob.glob(self.checkpoint_dir + '/ckpt_best*')
-        checkpoint_save_path = os.path.join(self.checkpoint_dir, "ckpt.pth")
-
-        if len(checkpoint_paths) != 0:
-            LOGGER.info("Start testing, checkpoint file found!")
+    def trainer(self, training_data, val_data, name):
+        state_dict = {}
+        ckpt_path = glob.glob(self.ckpt_dir + '/ckpt_best*')
+        ckpt_path_save = os.path.join(self.ckpt_dir, "ckpt.pth")
+        if len(ckpt_path) != 0:
+            LOGGER.info("Start testing, ckpt file found!")
             return 0., 0., 0., 0., 0., -1.
 
-        def update_model_state_dict():
-            """Update the model state dictionary."""
-            model_state_dict["discriminator"] = OrderedDict({
-                key: value.detach().cpu()
-                for key, value in self.discriminator.state_dict().items()
-            })
+        def update_state_dict():
+            state_dict["discriminator"] = OrderedDict({
+                k: v.detach().cpu()
+                for k, v in self.discriminator.state_dict().items()})
             if self.pre_proj > 0:
-                model_state_dict["pre_projection"] = OrderedDict({
-                    key: value.detach().cpu()
-                    for key, value in self.pre_projection.state_dict().items()
-                })
+                state_dict["pre_projection"] = OrderedDict({
+                    k: v.detach().cpu()
+                    for k, v in self.pre_projection.state_dict().items()})
 
-        # Training progress bar
+
         progress_bar = tqdm.tqdm(range(self.meta_epochs), unit='epoch')
         progress_bar_string = ""
-        best_performance_record = None
-
-        for current_epoch in progress_bar:
+        best_record = None
+        for i_epoch in progress_bar:
             self.forward_modules.eval()
 
-            # Train discriminator
-            progress_bar_str, _, _ = self._train_discriminator(
-                training_data,
-                current_epoch,
-                progress_bar,
-                progress_bar_string
-            )
-            update_model_state_dict()
+            progress_bar_str, pt, pf = self._train_discriminator(training_data, i_epoch, progress_bar, progress_bar_string)
+            update_state_dict()
 
-            # Evaluate model
-            if (current_epoch + 1) % self.eval_epochs == 0:
-                images, scores, segmentations, ground_truth_labels, ground_truth_masks = self.predict(validation_data)
+            if (i_epoch + 1) % self.eval_epochs == 0:
+                images, scores, segmentations, labels_gt, masks_gt = self.predict(val_data)
+                image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro = self._evaluate(images, scores, segmentations,
+                                                                                         labels_gt, masks_gt, name)
 
-                image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro = self._evaluate(
-                    images,
-                    scores,
-                    segmentations,
-                    ground_truth_labels,
-                    ground_truth_masks,
-                    dataset_name
-                )
+                self.logger.logger.add_scalar("i-auroc", image_auroc, i_epoch)
+                self.logger.logger.add_scalar("i-ap", image_ap, i_epoch)
+                self.logger.logger.add_scalar("p-auroc", pixel_auroc, i_epoch)
+                self.logger.logger.add_scalar("p-ap", pixel_ap, i_epoch)
+                self.logger.logger.add_scalar("p-pro", pixel_pro, i_epoch)
 
-                # Log metrics
-                self.logger.logger.add_scalar("image_auroc", image_auroc, current_epoch)
-                self.logger.logger.add_scalar("image_ap", image_ap, current_epoch)
-                self.logger.logger.add_scalar("pixel_auroc", pixel_auroc, current_epoch)
-                self.logger.logger.add_scalar("pixel_ap", pixel_ap, current_epoch)
-                self.logger.logger.add_scalar("pixel_pro", pixel_pro, current_epoch)
+                eval_path = './results/eval/' + name + '/'
+                train_path = './results/training/' + name + '/'
+                if best_record is None:
+                    best_record = [image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, i_epoch]
+                    ckpt_path_best = os.path.join(self.ckpt_dir, str(image_auroc) + "_" + str(pixel_auroc)+"_ckpt_best_{}.pth".format(i_epoch))
+                    torch.save(state_dict, ckpt_path_best)
+                    shutil.rmtree(eval_path, ignore_errors=True)
+                    shutil.copytree(train_path, eval_path)
 
-                # Save visualization paths
-                evaluation_save_path = './results/eval/' + dataset_name + '/'
-                training_save_path = './results/training/' + dataset_name + '/'
+                elif image_auroc + pixel_auroc > best_record[0] + best_record[2]:
+                    best_record = [image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, i_epoch]
+                    os.remove(ckpt_path_best)
+                    ckpt_path_best = os.path.join(self.ckpt_dir, str(image_auroc) + "_" + str(pixel_auroc)+"_ckpt_best_{}.pth".format(i_epoch))
+                    torch.save(state_dict, ckpt_path_best)
+                    shutil.rmtree(eval_path, ignore_errors=True)
+                    shutil.copytree(train_path, eval_path)
 
-                # Update best model
-                if best_performance_record is None:
-                    best_performance_record = [
-                        image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, current_epoch
-                    ]
-                    checkpoint_best_path = os.path.join(
-                        self.checkpoint_dir,
-                        f"{image_auroc}_{pixel_auroc}_ckpt_best_{current_epoch}.pth"
-                    )
-                    torch.save(model_state_dict, checkpoint_best_path)
-                    shutil.rmtree(evaluation_save_path, ignore_errors=True)
-                    shutil.copytree(training_save_path, evaluation_save_path)
-
-                elif image_auroc + pixel_auroc > best_performance_record[0] + best_performance_record[2]:
-                    best_performance_record = [
-                        image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, current_epoch
-                    ]
-                    os.remove(checkpoint_best_path)
-                    checkpoint_best_path = os.path.join(
-                        self.checkpoint_dir,
-                        f"{image_auroc}_{pixel_auroc}_ckpt_best_{current_epoch}.pth"
-                    )
-                    torch.save(model_state_dict, checkpoint_best_path)
-                    shutil.rmtree(evaluation_save_path, ignore_errors=True)
-                    shutil.copytree(training_save_path, evaluation_save_path)
-
-                # Update progress bar description
                 progress_bar_string = (
-                    f" IAUC:{round(image_auroc * 100, 2)}({round(best_performance_record[0] * 100, 2)})"
-                    f" IAP:{round(image_ap * 100, 2)}({round(best_performance_record[1] * 100, 2)})"
-                    f" PAUC:{round(pixel_auroc * 100, 2)}({round(best_performance_record[2] * 100, 2)})"
-                    f" PAP:{round(pixel_ap * 100, 2)}({round(best_performance_record[3] * 100, 2)})"
-                    f" PRO:{round(pixel_pro * 100, 2)}({round(best_performance_record[4] * 100, 2)})"
-                    f" E:{current_epoch}({best_performance_record[-1]})"
+                    f" IAUC:{round(image_auroc * 100, 2)}({round(best_record[0] * 100, 2)})"
+                    f" IAP:{round(image_ap * 100, 2)}({round(best_record[1] * 100, 2)})"
+                    f" PAUC:{round(pixel_auroc * 100, 2)}({round(best_record[2] * 100, 2)})"
+                    f" PAP:{round(pixel_ap * 100, 2)}({round(best_record[3] * 100, 2)})"
+                    f" PRO:{round(pixel_pro * 100, 2)}({round(best_record[4] * 100, 2)})"
+                    f" E:{i_epoch}({best_record[-1]})"
                 )
                 progress_bar_str += progress_bar_string
                 progress_bar.set_description_str(progress_bar_str)
 
-            # Save checkpoint
-            torch.save(model_state_dict, checkpoint_save_path)
+            torch.save(state_dict, ckpt_path_save)
+        return best_record
 
-        return best_performance_record
+    def _train_discriminator(self, input_data, current_epoch, progress_bar, progress_bar_string):
+        """Train the discriminator with multi-scale noise augmentation.
 
-    def _train_discriminator(self, training_data, current_epoch, progress_bar, progress_bar_string):
-        """Train the discriminator component of BridgeNet."""
+        Args:
+            input_data: Training data loader
+            current_epoch: Current epoch number
+            progress_bar: Progress bar object
+            progress_bar_string: string for progress bar
+
+        Returns:
+            Tuple of (progress_string, mean_true_prob, mean_fake_prob)
+        """
         self.forward_modules.eval()
         if self.pre_proj > 0:
             self.pre_projection.train()
         self.discriminator.train()
 
-        # Loss tracking
-        discriminator_losses = []
+        total_losses = []
         sample_count = 0
 
-        for iteration, data_batch in enumerate(training_data):
-            self.discriminator_optimizer.zero_grad()
+        for iteration, data_item in enumerate(input_data):
+            self.dsc_opt.zero_grad()
             if self.pre_proj > 0:
-                self.projection_optimizer.zero_grad()
+                self.proj_opt.zero_grad()
 
-            # Extract data
-            augmented_rgb_image = data_batch["aug_image"].to(torch.float).to(self.device)
-            original_rgb_image = data_batch["image"].to(torch.float).to(self.device)
-            augmented_depth_image = data_batch["aug_depth"].to(torch.float).to(self.device)
-            original_depth_image = data_batch["depth"].to(torch.float).to(self.device)
+            # Load data
+            augmented_image = data_item["augmented_image"].to(torch.float).to(self.device)
+            clean_image = data_item["image"].to(torch.float).to(self.device)
+            augmented_depth = data_item["augmented_depth"].to(torch.float).to(self.device)
+            clean_depth = data_item["depth"].to(torch.float).to(self.device)
 
-            # Generate noisy features if pre-projection is enabled
             if self.pre_proj > 0:
-                # First noise level
-                rgb_noise_level_low, depth_noise_level_low = self.get_rgb_depth_noise(
-                    6, original_rgb_image, original_depth_image
+                # High-scale noise (scale=6) on input images
+                noise_rgb_high, noise_depth_high = self.get_rgb_depth_noise(6, clean_image, clean_depth)
+                noisy_image_high = clean_image + noise_rgb_high
+                noisy_depth_high = clean_depth + noise_depth_high
+                noisy_rgb_features_high, _, noisy_depth_features_high = self._embed(
+                    noisy_image_high, depths=noisy_depth_high, evaluation=False
                 )
-                noisy_rgb_image_low = original_rgb_image + rgb_noise_level_low
-                noisy_depth_image_low = original_depth_image + depth_noise_level_low
+                noisy_features_high = torch.cat((noisy_rgb_features_high, noisy_depth_features_high), dim=1)
+                noisy_features_high = self.pre_projection(noisy_features_high)
 
-                noisy_rgb_features_low, _, noisy_depth_features_low = self.embed_features(
-                    noisy_rgb_image_low, depths=noisy_depth_image_low, evaluation=False
+                # Extract features from augmented images
+                augmented_rgb_features, _, augmented_depth_features = self._embed(
+                    augmented_image, depths=augmented_depth, evaluation=False
                 )
-                noisy_features_low = torch.cat((noisy_rgb_features_low, noisy_depth_features_low), dim=1)
-                noisy_features_low = self.pre_projection(noisy_features_low)
+                augmented_features = torch.cat((augmented_rgb_features, augmented_depth_features), dim=1)
+                augmented_features = self.pre_projection(augmented_features)
 
-                # Fake features (augmented data)
-                fake_rgb_features, _, fake_depth_features = self.embed_features(
-                    augmented_rgb_image, depths=augmented_depth_image, evaluation=False
-                )
-                fake_features = torch.cat((fake_rgb_features, fake_depth_features), dim=1)
-                fake_features = self.pre_projection(fake_features)
-
-                # True features (original data)
-                true_rgb_features, _, true_depth_features = self.embed_features(
-                    original_rgb_image, depths=original_depth_image, evaluation=False
+                # Extract clean features
+                clean_rgb_features, _, clean_depth_features = self._embed(
+                    clean_image, depths=clean_depth, evaluation=False
                 )
 
-                # Second noise level
-                rgb_noise_level_medium, depth_noise_level_medium = self.get_rgb_depth_noise(
-                    2, true_rgb_features, true_depth_features
+                # Medium-scale noise (scale=2) on features
+                noise_rgb_medium, noise_depth_medium = self.get_rgb_depth_noise(
+                    2, clean_rgb_features, clean_depth_features
                 )
-                noisy_rgb_features_medium = true_rgb_features + rgb_noise_level_medium
-                noisy_depth_features_medium = true_depth_features + depth_noise_level_medium
+                noisy_rgb_features_medium = clean_rgb_features + noise_rgb_medium
+                noisy_depth_features_medium = clean_depth_features + noise_depth_medium
                 noisy_features_medium = torch.cat((noisy_rgb_features_medium, noisy_depth_features_medium), dim=1)
-
-                true_features = torch.cat((true_rgb_features, true_depth_features), dim=1)
                 noisy_features_medium = self.pre_projection(noisy_features_medium)
-                true_features = self.pre_projection(true_features)
 
-                # Third noise level
-                noise_level_large = torch.normal(0, self.noise_level, true_features.shape).to(self.device)
-                noisy_features_large = true_features + noise_level_large
+                # Combine clean features
+                clean_features = torch.cat((clean_rgb_features, clean_depth_features), dim=1)
+                clean_features = self.pre_projection(clean_features)
+
+                # Low-scale noise (scale=1) on projected features
+                noise_low = torch.normal(0, self.noise, clean_features.shape).to(self.device)
+                noisy_features_low = clean_features + noise_low
             else:
-                raise ValueError("pre_proj must be greater than 0. Please set --pre_proj parameter to a positive value.")
+                print("****************")
 
-            # Ground truth masks
-            segmentation_mask = data_batch["mask_s"].reshape(-1, 1).to(self.device)
-            segmentation_mask_low = data_batch["mask_s_0"].reshape(-1, 1).to(self.device)
-            segmentation_mask_medium = data_batch["mask_s_1"].reshape(-1, 1).to(self.device)
+            mask_ground_truth = data_item["small_mask"].reshape(-1, 1).to(self.device)
 
-            # Discriminator losses for different noise levels
+
+            combined_scores_high = self.discriminator(torch.cat([clean_features, noisy_features_high]))
+            clean_scores_high = combined_scores_high[:len(clean_features)]
+            noisy_scores_high = combined_scores_high[len(clean_features):]
+            clean_loss_high = torch.nn.BCELoss()(clean_scores_high, torch.zeros_like(clean_scores_high))
+            noisy_loss_high = torch.nn.BCELoss()(noisy_scores_high, torch.ones_like(noisy_scores_high))
+            bce_loss_high = clean_loss_high + noisy_loss_high
+
+            combined_scores_medium = self.discriminator(torch.cat([clean_features, noisy_features_medium]))
+            clean_scores_medium = combined_scores_medium[:len(clean_features)]
+            noisy_scores_medium = combined_scores_medium[len(clean_features):]
+            clean_loss_medium = torch.nn.BCELoss()(clean_scores_medium, torch.zeros_like(clean_scores_medium))
+            noisy_loss_medium = torch.nn.BCELoss()(noisy_scores_medium, torch.ones_like(noisy_scores_medium))
+            bce_loss_medium = clean_loss_medium + noisy_loss_medium
+
+            combined_scores_low = self.discriminator(torch.cat([clean_features, noisy_features_low]))
+            clean_scores_low = combined_scores_low[:len(clean_features)]
+            noisy_scores_low = combined_scores_low[len(clean_features):]
+            clean_loss_low = torch.nn.BCELoss()(clean_scores_low, torch.zeros_like(clean_scores_low))
+            noisy_loss_low = torch.nn.BCELoss()(noisy_scores_low, torch.ones_like(noisy_scores_low))
+            bce_loss_low = clean_loss_low + noisy_loss_low
+
+            total_bce_loss = bce_loss_high + bce_loss_medium + bce_loss_low
+
+
+
+
+
+            augmented_scores = self.discriminator(augmented_features)
+            focal_output = torch.cat([1 - augmented_scores, augmented_scores], dim=1)
+            focal_loss = self.focal_loss(focal_output, mask_ground_truth)
+
+            total_loss = total_bce_loss + 1.0 * focal_loss
+            total_loss.backward()
             if self.pre_proj > 0:
-                # First level (low)
-                scores_low = self.discriminator(torch.cat([true_features, noisy_features_low]))
-                true_scores_low = scores_low[:len(true_features)]
-                noisy_scores_low = scores_low[len(true_features):]
-                true_loss_low = torch.nn.BCELoss()(true_scores_low, torch.zeros_like(true_scores_low))
-                noisy_loss_low = torch.nn.BCELoss()(noisy_scores_low, torch.ones_like(noisy_scores_low))
-                bce_loss_low = true_loss_low + noisy_loss_low
+                self.proj_opt.step()
+            if self.train_backbone:
+                self.backbone_opt.step()
+            self.dsc_opt.step()
 
-                # Second level (medium)
-                scores_medium = self.discriminator(torch.cat([true_features, noisy_features_medium]))
-                true_scores_medium = scores_medium[:len(true_features)]
-                noisy_scores_medium = scores_medium[len(true_features):]
-                true_loss_medium = torch.nn.BCELoss()(true_scores_medium, torch.zeros_like(true_scores_medium))
-                noisy_loss_medium = torch.nn.BCELoss()(noisy_scores_medium, torch.ones_like(noisy_scores_medium))
-                bce_loss_medium = true_loss_medium + noisy_loss_medium
+            self.logger.logger.add_scalar("loss", total_loss, self.logger.g_iter)
+            self.logger.step()
 
-                # Third level (large)
-                scores_large = self.discriminator(torch.cat([true_features, noisy_features_large]))
-                true_scores_large = scores_large[:len(true_features)]
-                noisy_scores_large = scores_large[len(true_features):]
-                true_loss_large = torch.nn.BCELoss()(true_scores_large, torch.zeros_like(true_scores_large))
-                noisy_loss_large = torch.nn.BCELoss()(noisy_scores_large, torch.ones_like(noisy_scores_large))
-                bce_loss_large = true_loss_large + noisy_loss_large
+            total_losses.append(total_loss.detach().cpu().item())
 
-                # Total BCE loss
-                total_bce_loss = bce_loss_low + bce_loss_medium + bce_loss_large
+            total_losses_ = np.mean(total_losses)
+            sample_count = sample_count + clean_image.shape[0]
 
-                # Focal loss for fake features
-                fake_scores = self.discriminator(fake_features)
-                fake_scores_prob = fake_scores
-                mask = segmentation_mask
-                output = torch.cat([1 - fake_scores_prob, fake_scores_prob], dim=1)
-                focal_loss = self.focal_loss(output, mask)
+            # Update progress bar
+            progress_bar_description = f"epoch:{current_epoch} loss:{total_losses_:.2e}"
+            progress_bar_description += f" sample:{sample_count}"
+            final_progress_bar_string = progress_bar_description
+            final_progress_bar_string += progress_bar_string
+            progress_bar.set_description_str(final_progress_bar_string)
 
-                # Total loss
-                total_loss = total_bce_loss + 1.0 * focal_loss
+            if sample_count > self.limit:
+                break
 
-                # Backpropagation
-                total_loss.backward()
-                if self.pre_proj > 0:
-                    self.projection_optimizer.step()
-                if self.train_backbone:
-                    self.backbone_optimizer.step()
-                    self.backbone_depth_optimizer.step()
-                self.discriminator_optimizer.step()
+        return final_progress_bar_string, None, None
 
-                # Log loss
-                self.logger.logger.add_scalar("discriminator_loss", total_loss, self.logger.global_iteration)
-                self.logger.step()
-
-                discriminator_losses.append(total_loss.detach().cpu().item())
-                average_loss = np.mean(discriminator_losses)
-                sample_count += original_rgb_image.shape[0]
-
-                # Update progress bar
-                progress_bar_description = f"epoch:{current_epoch} loss:{average_loss:.2e}"
-                progress_bar_description += f" sample:{sample_count}"
-                final_progress_bar_string = progress_bar_description
-                final_progress_bar_string += progress_bar_string
-                progress_bar.set_description_str(final_progress_bar_string)
-
-                # Check sample limit
-                if sample_count > self.sample_limit:
-                    break
-
-        return final_progress_bar_string, 0, 0
-
-    def tester(self, test_data, dataset_name):
-        """Test the BridgeNet model."""
-        # Use os.listdir and fnmatch instead of glob.glob due to potential issues
-        # Match any file containing "ckpt_best" anywhere in the filename
-        checkpoint_paths = []
-        if os.path.isdir(self.checkpoint_dir):
-            for filename in os.listdir(self.checkpoint_dir):
-                if fnmatch.fnmatch(filename, '*ckpt_best*'):
-                    checkpoint_paths.append(os.path.join(self.checkpoint_dir, filename))
-
-        if len(checkpoint_paths) != 0:
-            model_state_dict = torch.load(checkpoint_paths[0], map_location=self.device)
-            if 'discriminator' in model_state_dict:
-                self.discriminator.load_state_dict(model_state_dict['discriminator'])
-                if "pre_projection" in model_state_dict:
-                    self.pre_projection.load_state_dict(model_state_dict["pre_projection"])
+    def tester(self, test_data, name):
+        ckpt_path = glob.glob(self.ckpt_dir + '/ckpt_best*')
+        if len(ckpt_path) != 0:
+            state_dict = torch.load(ckpt_path[0], map_location=self.device)
+            if 'discriminator' in state_dict:
+                self.discriminator.load_state_dict(state_dict['discriminator'])
+                if "pre_projection" in state_dict:
+                    self.pre_projection.load_state_dict(state_dict["pre_projection"])
             else:
-                self.load_state_dict(model_state_dict, strict=False)
+                self.load_state_dict(state_dict, strict=False)
 
-            images, scores, segmentations, ground_truth_labels, ground_truth_masks = self.predict(test_data)
-            image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro = self._evaluate(
-                images,
-                scores,
-                segmentations,
-                ground_truth_labels,
-                ground_truth_masks,
-                dataset_name,
-                path='eval'
-            )
-            epoch = int(checkpoint_paths[0].split('_')[-1].split('.')[0])
+            images, scores, segmentations, labels_gt, masks_gt = self.predict(test_data)
+            image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro = self._evaluate(images, scores, segmentations,
+                                                                                     labels_gt, masks_gt, name, path='eval')
+            epoch = int(ckpt_path[0].split('_')[-1].split('.')[0])
         else:
             image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch = 0., 0., 0., 0., 0., -1.
-            LOGGER.info("No checkpoint file found!")
+            LOGGER.info("No ckpt file found!")
 
         return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch
 
-    def _evaluate(
-        self,
-        images,
-        scores,
-        segmentations,
-        ground_truth_labels,
-        ground_truth_masks,
-        dataset_name,
-        path='training'
-    ):
-        """Evaluate model performance."""
+    def _evaluate(self, images, scores, segmentations, labels_gt, masks_gt, name, path='training'):
         scores = np.squeeze(np.array(scores))
-        min_score = min(scores)
-        max_score = max(scores)
-        normalized_scores = (scores - min_score) / (max_score - min_score + 1e-10)
+        image_min_scores = min(scores)
+        image_max_scores = max(scores)
+        norm_scores = (scores - image_min_scores) / (image_max_scores - image_min_scores + 1e-10)
 
-        # Compute image-level metrics
-        image_scores = metrics.compute_imagewise_retrieval_metrics(
-            normalized_scores,
-            ground_truth_labels,
-            path
-        )
+        image_scores = metrics.compute_imagewise_retrieval_metrics(norm_scores, labels_gt, path)
         image_auroc = image_scores["auroc"]
         image_ap = image_scores["ap"]
 
-        # Compute pixel-level metrics
-        if len(ground_truth_masks) > 0:
+        if len(masks_gt) > 0:
             segmentations = np.array(segmentations)
-            min_seg_score = np.min(segmentations)
-            max_seg_score = np.max(segmentations)
-            normalized_segmentations = (segmentations - min_seg_score) / (max_seg_score - min_seg_score + 1e-10)
+            min_scores = np.min(segmentations)
+            max_scores = np.max(segmentations)
+            norm_segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-10)
 
-            pixel_scores = metrics.compute_pixelwise_retrieval_metrics(
-                normalized_segmentations,
-                ground_truth_masks,
-                path
-            )
+            pixel_scores = metrics.compute_pixelwise_retrieval_metrics(norm_segmentations, masks_gt, path)
             pixel_auroc = pixel_scores["auroc"]
             pixel_ap = pixel_scores["ap"]
-
             if path == 'eval':
                 try:
-                    pixel_pro = metrics.compute_pro(
-                        np.squeeze(np.array(ground_truth_masks)),
-                        normalized_segmentations
-                    )
+                    pixel_pro = metrics.compute_pro(np.squeeze(np.array(masks_gt)), norm_segmentations)
+
                 except:
                     pixel_pro = 0.
             else:
                 pixel_pro = 0.
+
         else:
             pixel_auroc = -1.
             pixel_ap = -1.
             pixel_pro = -1.
             return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro
 
-        # Generate visualization
-        self._save_visualization(
-            images,
-            ground_truth_masks,
-            normalized_segmentations,
-            dataset_name,
-            path
-        )
+        defects = np.array(images)
+        targets = np.array(masks_gt)
+        for i in range(len(defects)):
+            defect = utils.torch_format_2_numpy_img(defects[i])
+            target = utils.torch_format_2_numpy_img(targets[i])
 
-        return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro
-
-    def _save_visualization(
-        self,
-        images,
-        ground_truth_masks,
-        normalized_segmentations,
-        dataset_name,
-        path
-    ):
-        """Save visualization results."""
-        defect_images = np.array(images)
-        target_masks = np.array(ground_truth_masks)
-
-        for i in range(len(defect_images)):
-            defect_image = utils.torch_format_2_numpy_img(defect_images[i])
-            target_mask = utils.torch_format_2_numpy_img(target_masks[i])
-
-            # Create colored segmentation map
-            mask = cv2.cvtColor(
-                cv2.resize(
-                    normalized_segmentations[i],
-                    (defect_image.shape[1], defect_image.shape[0])
-                ),
-                cv2.COLOR_GRAY2BGR
-            )
+            mask = cv2.cvtColor(cv2.resize(norm_segmentations[i], (defect.shape[1], defect.shape[0])),
+                                cv2.COLOR_GRAY2BGR)
             mask = (mask * 255).astype('uint8')
             mask = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
 
-            # Combine images for visualization
-            combined_image = np.hstack([defect_image, target_mask, mask])
-            combined_image = cv2.resize(combined_image, (256 * 3, 256))
+            image_up = np.hstack([defect, target, mask])
+            image_up = cv2.resize(image_up, (256 * 3, 256))
+            full_path = './results/' + path + '/' + name + '/'
+            utils.del_remake_dir(full_path, del_flag=False)
+            cv2.imwrite(full_path + str(i + 1).zfill(3) + '.png', image_up)
 
-            # Save visualization
-            save_directory = './results/' + path + '/' + dataset_name + '/'
-            utils.del_remake_dir(save_directory, del_flag=False)
-            cv2.imwrite(save_directory + str(i + 1).zfill(3) + '.png', combined_image)
+        return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro
 
     def predict(self, test_dataloader):
-        """Generate predictions for the test dataset."""
+        """This function provides anomaly scores/maps for full dataloaders."""
         self.forward_modules.eval()
 
         image_paths = []
@@ -799,30 +577,29 @@ class BridgeNet(torch.nn.Module):
         depths = []
         scores = []
         masks = []
-        ground_truth_labels = []
-        ground_truth_masks = []
+        labels_gt = []
+        masks_gt = []
 
         with tqdm.tqdm(test_dataloader, desc="Inferring...", leave=False, unit='batch') as data_iterator:
             for data in data_iterator:
                 if isinstance(data, dict):
-                    ground_truth_labels.extend(data["is_anomaly"].numpy().tolist())
-                    if data.get("mask_gt", None) is not None:
-                        ground_truth_masks.extend(data["mask_gt"].numpy().tolist())
+                    labels_gt.extend(data["is_anomaly"].numpy().tolist())
+                    if data.get("ground_truth_mask", None) is not None:
+                        masks_gt.extend(data["ground_truth_mask"].numpy().tolist())
                     image = data["image"]
                     depth = data["depth"]
                     images.extend(image.numpy().tolist())
                     depths.extend(image.numpy().tolist())
                     image_paths.extend(data["image_path"])
-
                 _scores, _masks = self._predict(image, depth)
                 for score, mask in zip(_scores, _masks):
                     scores.append(score)
                     masks.append(mask)
 
-        return images, scores, masks, ground_truth_labels, ground_truth_masks
+        return images, scores, masks, labels_gt, masks_gt
 
     def _predict(self, image, depth):
-        """Generate predictions for a batch of images."""
+        """Infer score and mask for a batch of images."""
         image = image.to(torch.float).to(self.device)
         depth = depth.to(torch.float).to(self.device)
         self.forward_modules.eval()
@@ -832,32 +609,21 @@ class BridgeNet(torch.nn.Module):
         self.discriminator.eval()
 
         with torch.no_grad():
-            # Extract features
-            patch_features, patch_shapes, depth_features = self.embed_features(
-                image,
-                depths=depth,
-                provide_patch_shapes=True,
-                evaluation=True
-            )
 
-            # Combine RGB and depth features
-            patch_features = torch.cat((patch_features, depth_features), dim=1)
-
-            # Apply pre-projection if enabled
+            patch_features, patch_shapes, depth_features = self._embed(image,depths=depth, provide_patch_shapes=True, evaluation=True)
+            patch_features = torch.cat((patch_features,depth_features),dim=1)
             if self.pre_proj > 0:
                 patch_features = self.pre_projection(patch_features)
                 patch_features = patch_features[0] if len(patch_features) == 2 else patch_features
 
-            # Generate scores
-            patch_scores = image_scores = self.discriminator(patch_features)
 
-            # Convert patch scores to segmentation masks
+
+            patch_scores = image_scores = self.discriminator(patch_features)
             patch_scores = self.patch_maker.unpatch_scores(patch_scores, batchsize=image.shape[0])
             scales = patch_shapes[0]
             patch_scores = patch_scores.reshape(image.shape[0], scales[0], scales[1])
             masks = self.anomaly_segmentor.convert_to_segmentation(patch_scores)
 
-            # Convert to image-level scores
             image_scores = self.patch_maker.unpatch_scores(image_scores, batchsize=image.shape[0])
             image_scores = self.patch_maker.score(image_scores)
             if isinstance(image_scores, torch.Tensor):

@@ -1,4 +1,6 @@
 from datetime import datetime
+
+import pandas as pd
 import os
 import logging
 import sys
@@ -9,8 +11,6 @@ import backbones
 import bridgenet
 import utils
 
-LOGGER = logging.getLogger(__name__)
-
 
 @click.group(chain=True)
 @click.option("--results_path", type=str, default="results")
@@ -19,14 +19,8 @@ LOGGER = logging.getLogger(__name__)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
 @click.option("--run_name", type=str, default="test")
-@click.option("--test_mode", type=str, default="ckpt")
+@click.option("--test", type=str, default="ckpt")
 def main(**kwargs):
-    """
-    Main entry point for BridgeNet anomaly detection training and testing.
-
-    This CLI provides a flexible interface for configuring and running
-    BridgeNet models on various datasets with different parameters.
-    """
     pass
 
 
@@ -44,8 +38,9 @@ def main(**kwargs):
 @click.option("--dsc_hidden", type=int, default=1024)
 @click.option("--pre_proj", type=int, default=1)
 @click.option("--noise", type=float, default=0.015)
+@click.option("--radius", type=float, default=0.75)
+@click.option("--p", type=float, default=0.5)
 @click.option("--lr", type=float, default=0.00005)
-@click.option("--svd", type=int, default=0)
 @click.option("--step", type=int, default=20)
 @click.option("--limit", type=int, default=392)
 def net(
@@ -62,25 +57,25 @@ def net(
         train_backbone,
         pre_proj,
         noise,
+        radius,
+        p,
         lr,
-        svd,
         step,
         limit,
 ):
-    """
-    Configure BridgeNet network architecture and training parameters.
-
-    This command sets up the model configuration including backbone networks,
-    feature extraction layers, training hyperparameters, and optimization settings.
-    """
     backbone_names = list(backbone_names)
-    layers_to_extract_from_coll = [layers_to_extract_from] if len(backbone_names) == 1 else [layers_to_extract_from] * len(backbone_names)
+    if len(backbone_names) > 1:
+        layers_to_extract_from_coll = []
+        for idx in range(len(backbone_names)):
+            layers_to_extract_from_coll.append(layers_to_extract_from)
+    else:
+        layers_to_extract_from_coll = [layers_to_extract_from]
 
     def get_bridgenet(input_shape, device):
-        """Create and configure BridgeNet models based on specified parameters."""
-        bridgenet_models = []
-        for backbone_name, layers_to_extract in zip(backbone_names, layers_to_extract_from_coll):
+        bridgenets = []
+        for backbone_name, layers_to_extract_from in zip(backbone_names, layers_to_extract_from_coll):
             backbone_seed = None
+            # Load pretrained model based on backbone type
             if ".seed-" in backbone_name:
                 backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(backbone_name.split("-")[-1])
             backbone = backbones.load(backbone_name)
@@ -88,11 +83,12 @@ def net(
             backbone.name, backbone.seed = backbone_name, backbone_seed
             backbone_depth.name, backbone_depth.seed = backbone_name, backbone_seed
 
-            bridgenet_model = bridgenet.BridgeNet(device)
-            bridgenet_model.load(
-                backbone_network=backbone,
-                backbone_depth_network=backbone_depth,
-                layers_to_extract_from=layers_to_extract,
+            # BridgeNet is the main data augmentation + SimpleNet model
+            bridgenet_inst = bridgenet.BridgeNet(device)
+            bridgenet_inst.load(
+                backbone=backbone,
+                backbone_depth=backbone_depth,
+                layers_to_extract_from=layers_to_extract_from,
                 device=device,
                 input_shape=input_shape,
                 pretrain_embed_dimension=pretrain_embed_dimension,
@@ -106,13 +102,14 @@ def net(
                 train_backbone=train_backbone,
                 pre_proj=pre_proj,
                 noise=noise,
+                radius=radius,
+                p=p,
                 lr=lr,
-                svd=svd,
                 step=step,
-                limit=limit
+                limit=limit,
             )
-            bridgenet_models.append(bridgenet_model.to(device))
-        return bridgenet_models
+            bridgenets.append(bridgenet_inst.to(device))
+        return bridgenets
 
     return "get_bridgenet", get_bridgenet
 
@@ -124,7 +121,8 @@ def net(
 @click.option("--subdatasets", "-d", multiple=True, type=str, required=True)
 @click.option("--batch_size", default=8, type=int, show_default=True)
 @click.option("--num_workers", default=16, type=int, show_default=True)
-@click.option("--imagesize", default=576, type=int, show_default=True)
+@click.option("--resize", default=288, type=int, show_default=True)
+@click.option("--imagesize", default=288, type=int, show_default=True)
 @click.option("--rotate_degrees", default=0, type=int)
 @click.option("--translate", default=0, type=float)
 @click.option("--scale", default=0.0, type=float)
@@ -134,6 +132,7 @@ def net(
 @click.option("--gray", default=0.0, type=float)
 @click.option("--hflip", default=0.0, type=float)
 @click.option("--vflip", default=0.0, type=float)
+@click.option("--distribution", default=0, type=int)
 @click.option("--mean", default=0.5, type=float)
 @click.option("--std", default=0.1, type=float)
 @click.option("--fg", default=1, type=int)
@@ -145,6 +144,7 @@ def dataset(
         aug_path,
         subdatasets,
         batch_size,
+        resize,
         imagesize,
         num_workers,
         rotate_degrees,
@@ -156,41 +156,31 @@ def dataset(
         gray,
         hflip,
         vflip,
+        distribution,
         mean,
         std,
         fg,
         rand_aug,
         augment,
 ):
-    """
-    Configure dataset settings and data loading parameters.
-
-    This command sets up data loaders for training and testing with specified
-    augmentation parameters and dataset configurations.
-    """
     name = "mvtec3d"
-    dataset_registry = {
-        "mvtec": ["datasets.mvtec", "MVTecDataset"],
-        "visa": ["datasets.visa", "VisADataset"],
-        "mpdd": ["datasets.mvtec", "MVTecDataset"],
-        "wfdd": ["datasets.mvtec", "MVTecDataset"],
-        "mvtec3d": ["datasets.mvtec3d", "MVTec3dDataset"],
-    }
-    dataset_info = dataset_registry[name]
+    _DATASETS = {"mvtec": ["datasets.mvtec", "MVTecDataset"], "visa": ["datasets.visa", "VisADataset"],
+                 "mpdd": ["datasets.mvtec", "MVTecDataset"], "wfdd": ["datasets.mvtec", "MVTecDataset"],
+                 "mvtec3d": ["datasets.mvtec3d", "MVTec3dDataset"],}
+    dataset_info = _DATASETS[name]
     dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
 
-    def get_dataloaders(seed, test_mode, get_name=name):
-        """Create training and testing data loaders for specified datasets."""
+    def get_dataloaders(seed, test, get_name=name):
         dataloaders = []
         for subdataset in subdatasets:
             test_dataset = dataset_library.__dict__[dataset_info[1]](
                 data_path,
                 aug_path,
-                class_name=subdataset,
-                resize_size=imagesize,
-                crop_size=imagesize,
+                classname=subdataset,
+                resize=resize,
+                imagesize=imagesize,
                 split=dataset_library.DatasetSplit.TEST,
-                seed=seed
+                seed=seed,
             )
 
             test_dataloader = torch.utils.data.DataLoader(
@@ -204,14 +194,14 @@ def dataset(
 
             test_dataloader.name = get_name + "_" + subdataset
 
-            if test_mode == 'ckpt':
+            if test == 'ckpt':
                 train_dataset = dataset_library.__dict__[dataset_info[1]](
                     data_path,
                     aug_path,
                     dataset_name=get_name,
-                    class_name=subdataset,
-                    resize_size=imagesize,
-                    crop_size=imagesize,
+                    classname=subdataset,
+                    resize=resize,
+                    imagesize=imagesize,
                     split=dataset_library.DatasetSplit.TRAIN,
                     seed=seed,
                     rotate_degrees=rotate_degrees,
@@ -223,12 +213,13 @@ def dataset(
                     h_flip_p=hflip,
                     v_flip_p=vflip,
                     scale=scale,
+                    distribution=distribution,
                     mean=mean,
                     std=std,
                     fg=fg,
                     rand_aug=rand_aug,
                     augment=augment,
-                    batch_size=batch_size
+                    batch_size=batch_size,
                 )
 
                 train_dataloader = torch.utils.data.DataLoader(
@@ -254,7 +245,7 @@ def dataset(
 
         print("\n")
         return dataloaders
-
+    
     return "get_dataloaders", get_dataloaders
 
 
@@ -267,30 +258,26 @@ def run(
         log_group,
         log_project,
         run_name,
-        test_mode,
+        test,
 ):
-    """
-    Execute the training/testing pipeline with configured methods.
-
-    This function orchestrates the entire process by setting up the environment,
-    initializing models and data loaders, and running training/testing loops.
-    """
     methods = {key: item for (key, item) in methods}
 
     run_save_path = utils.create_storage_folder(
         results_path, log_project, log_group, run_name, mode="overwrite"
     )
 
-    list_of_dataloaders = methods["get_dataloaders"](seed, test_mode)
+    list_of_dataloaders = methods["get_dataloaders"](seed, test)
 
     device = utils.set_torch_device(gpu)
 
     result_collect = []
+    data = {'Class': [], 'Distribution': [], 'Foreground': []}
+    df = pd.DataFrame(data)
     for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
         utils.fix_seeds(seed, device)
         dataset_name = dataloaders["training"].name
-        imagesize = dataloaders["training"].dataset.image_shape
-        bridgenet_models = methods["get_bridgenet"](imagesize, device)
+        imagesize = dataloaders["training"].dataset.imagesize
+        bridgenet_list = methods["get_bridgenet"](imagesize, device)
 
         LOGGER.info(
             "Selecting dataset [{}] ({}/{}) {}".format(
@@ -303,46 +290,50 @@ def run(
 
         models_dir = os.path.join(run_save_path, "models")
         os.makedirs(models_dir, exist_ok=True)
-        for i, bridgenet_model in enumerate(bridgenet_models):
-            if bridgenet_model.backbone_network.seed is not None:
-                utils.fix_seeds(bridgenet_model.backbone_network.seed, device)
+        for i, BridgeNet in enumerate(bridgenet_list):
+            flag = 0., 0., 0., 0., 0., -1.
+            if BridgeNet.backbone.seed is not None:
+                utils.fix_seeds(BridgeNet.backbone.seed, device)
 
-            bridgenet_model.set_model_dir(os.path.join(models_dir, f"backbone_{i}"), dataset_name)
-            if test_mode == 'ckpt':
-                bridgenet_model.trainer(dataloaders["training"], dataloaders["testing"], dataset_name)
+            BridgeNet.set_model_dir(os.path.join(models_dir, f"backbone_{i}"), dataset_name)
+            if test == 'ckpt':
+                flag = BridgeNet.trainer(dataloaders["training"], dataloaders["testing"], dataset_name)
 
-            image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch = bridgenet_model.tester(dataloaders["testing"], dataset_name)
-            result_collect.append(
-                {
-                    "dataset_name": dataset_name,
-                    "image_auroc": image_auroc,
-                    "image_ap": image_ap,
-                    "pixel_auroc": pixel_auroc,
-                    "pixel_ap": pixel_ap,
-                    "pixel_pro": pixel_pro,
-                    "best_epoch": epoch,
-                }
-            )
+            if type(flag) != int:
+                i_auroc, i_ap, p_auroc, p_ap, p_pro, epoch = BridgeNet.tester(dataloaders["testing"], dataset_name)
+                result_collect.append(
+                    {
+                        "dataset_name": dataset_name,
+                        "image_auroc": i_auroc,
+                        "image_ap": i_ap,
+                        "pixel_auroc": p_auroc,
+                        "pixel_ap": p_ap,
+                        "pixel_pro": p_pro,
+                        "best_epoch": epoch,
+                    }
+                )
 
-            if epoch > -1:
-                for key, item in result_collect[-1].items():
-                    if isinstance(item, str):
-                        continue
-                    elif isinstance(item, int):
-                        print(f"{key}:{item}")
-                    else:
-                        print(f"{key}:{round(item * 100, 2)} ", end="")
+                if epoch > -1:
+                    for key, item in result_collect[-1].items():
+                        if isinstance(item, str):
+                            continue
+                        elif isinstance(item, int):
+                            print(f"{key}:{item}")
+                        else:
+                            print(f"{key}:{round(item * 100, 2)} ", end="")
 
-            print("\n")
-            result_metric_names = list(result_collect[-1].keys())[1:]
-            result_dataset_names = [results["dataset_name"] for results in result_collect]
-            result_scores = [list(results.values())[1:] for results in result_collect]
-            utils.compute_and_store_final_results(
-                run_save_path,
-                result_scores,
-                result_metric_names,
-                row_names=result_dataset_names,
-            )
+                # save results csv after each category
+                print("\n")
+                result_metric_names = list(result_collect[-1].keys())[1:]
+                result_dataset_names = [results["dataset_name"] for results in result_collect]
+                result_scores = [list(results.values())[1:] for results in result_collect]
+                utils.compute_and_store_final_results(
+                    run_save_path,
+                    result_scores,
+                    result_metric_names,
+                    row_names=result_dataset_names,
+                )
+
 
 
 if __name__ == "__main__":
