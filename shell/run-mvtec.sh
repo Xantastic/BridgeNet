@@ -29,5 +29,5 @@ python main.py \
     --std 0.3 \
     --rand_aug 1 \
     --batch_size 4 \
-    --resize 224 \
-    --imagesize 224 "${flags[@]}" mvtec $datapath $augpath
+    --resize 576 \
+    --imagesize 576 "${flags[@]}" mvtec $datapath $augpath
