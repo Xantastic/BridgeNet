@@ -36,7 +36,7 @@ conda activate bridgenet
 pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 -f https://download.pytorch.org/whl/torch_stable.html
 
 # Install other dependencies
-pip install -r requirements.txt
+pip install ...
 ```
 
 ### 2. Dataset Structure
