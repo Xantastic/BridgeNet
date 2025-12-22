@@ -106,7 +106,7 @@ Each category (e.g., cookie, dowel) contains:
 - `test/<anomaly>/`: Anomalous test samples
 - `ground_truth/<anomaly>/`: Ground truth masks for anomalies
 
-The dataset formatted [[coming soon]](https://github.com/Xantastic/BridgeNet)
+The dataset formatted [[mvtec3d_formatted]](https://pan.baidu.com/s/1K-mHeK-clHmBru82U5R90g?pwd=6p7f)
 
 Original dataset [[mvtec3d]](https://www.mvtec.com/company/research/datasets/mvtec-3d-ad)
 
