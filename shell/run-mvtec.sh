@@ -1,5 +1,5 @@
-datapath=/root/3D/GLASS-mvtec-3d-dataset/datasets/mvtec_process
-augpath=/root/3D/GLASS-mvtec-3d-dataset/datasets/dtd/images
+datapath=/root/datasets/mvtec_process
+augpath=/root/datasets/dtd/images
 classes=('cookie')
 flags=($(for class in "${classes[@]}"; do echo '-d '"${class}"; done))
 
