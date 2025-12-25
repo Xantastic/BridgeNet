@@ -110,6 +110,7 @@ The dataset formatted [[mvtec3d_formatted]](https://pan.baidu.com/s/1K-mHeK-clHm
 
 Original dataset [[mvtec3d]](https://www.mvtec.com/company/research/datasets/mvtec-3d-ad)
 
+Texture anomaly dataset [[dtd]](https://www.robots.ox.ac.uk/~vgg/data/dtd/)
 ### 3. Running BridgeNet
 
 We provide a simple shell script to run BridgeNet on the MVTec-3D dataset:
