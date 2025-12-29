@@ -12,7 +12,7 @@ Our paper has been accepted by ACM MM 2025 [[Paper]](https://dl.acm.org/doi/pdf/
 - Python 3.9
 - Conda package manager
 
-#### Option A: Automatic Installation (Recommended)
+#### Option A: Automatic Installation
 
 ```bash
 # Clone the repository
